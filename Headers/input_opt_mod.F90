@@ -179,6 +179,7 @@ MODULE Input_Opt_Mod
      LOGICAL                     :: AUTOREDUCE_IS_KEY_THRESHOLD
      LOGICAL                     :: AUTOREDUCE_IS_PRS_THRESHOLD
      LOGICAL                     :: AUTOREDUCE_IS_APPEND
+     LOGICAL                     :: Chem_LoadBalance
      REAL(f8)                    :: AUTOREDUCE_THRESHOLD
      REAL(f8)                    :: AUTOREDUCE_TUNING_OH
      REAL(f8)                    :: AUTOREDUCE_TUNING_NO2
@@ -666,6 +667,7 @@ CONTAINS
     Input_Opt%USE_TOMS_O3            = .FALSE.
 
     Input_Opt%USE_AUTOREDUCE                = .FALSE.
+    Input_Opt%Chem_LoadBalance              = .FALSE.
     Input_Opt%AUTOREDUCE_IS_KEY_THRESHOLD   = .TRUE.
     Input_Opt%AUTOREDUCE_TUNING_OH          = 5e-5_fp
     Input_Opt%AUTOREDUCE_TUNING_NO2         = 1e-4_fp

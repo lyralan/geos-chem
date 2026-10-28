@@ -2389,6 +2389,27 @@ CONTAINS
     ENDIF
     Input_Opt%AUTOREDUCE_IS_APPEND = v_bool
 
+    !------------------------------------------------------------------------
+    ! Spread the KPP integration evenly over the MPI ranks (GCHP only)
+    ! load_balance: false
+    !------------------------------------------------------------------------
+    key   = "operations%chemistry%load_balance"
+    v_bool = MISSING_BOOL
+    CALL QFYAML_Add_Get( Config, TRIM( key ), v_bool, "", RC )
+    IF ( RC /= GC_SUCCESS ) THEN
+       errMsg = 'Error parsing ' // TRIM( key ) // '!'
+       CALL GC_Error( errMsg, RC, thisLoc )
+       RETURN
+    ENDIF
+    Input_Opt%Chem_LoadBalance = v_bool
+#if !defined( MODEL_GCHP )
+    IF ( Input_Opt%Chem_LoadBalance ) THEN
+       errMsg = 'load_balance: true is only available in GCHP!'
+       CALL GC_Error( errMsg, RC, thisLoc )
+       RETURN
+    ENDIF
+#endif
+
     ! Return success
     RC = GC_SUCCESS
 
@@ -2415,6 +2436,7 @@ CONTAINS
        ENDIF
        WRITE( 6,100 ) 'Keep halogen spec. active?  : ', Input_Opt%AUTOREDUCE_IS_KEEPACTIVE
        WRITE( 6,100 ) 'Use append in auto-reduce?  : ', Input_Opt%AUTOREDUCE_IS_APPEND
+       WRITE( 6,100 ) 'Balance KPP over MPI ranks? : ', Input_Opt%Chem_LoadBalance
     ENDIF
 
     ! FORMAT statements

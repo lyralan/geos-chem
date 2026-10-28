@@ -112,6 +112,7 @@ CONTAINS
     USE fullchem_SulfurChemFuncs, ONLY : fullchem_ConvertAlkToEquiv
     USE fullchem_SulfurChemFuncs, ONLY : fullchem_ConvertEquivToAlk
     USE fullchem_SulfurChemFuncs, ONLY : fullchem_HetDropChem
+    USE FullChem_LB_Mod
     USE GcKpp_Monitor,            ONLY : SPC_NAMES, FAM_NAMES, EQN_NAMES
     USE GcKpp_Parameters
     USE GcKpp_Integrator,         ONLY : Integrate
@@ -171,6 +172,7 @@ CONTAINS
 !
     ! Scalars
     LOGICAL                :: IsLocNoon,  Size_Res,  Failed2x, doSuppress
+    INTEGER                :: lbPass     ! 0: no load balancing; 1, 2: passes
     INTEGER                :: I,          J,         L,        N
     INTEGER                :: NA,         F,         SpcID,    KppID
     INTEGER                :: P,          MONTH,     YEAR,     Day
@@ -509,7 +511,19 @@ CONTAINS
     ! it gets another chunk of 24 boxes.  This should lead to better
     ! load balancing, and will spread the sunrise/sunset boxes across
     ! more cores.
+    !
+    ! With chemistry load balancing (GCHP, load_balance: true) the loop runs
+    ! twice: pass 1 prepares every box and stores the KPP inputs, LB_Run
+    ! integrates all boxes spread evenly over the MPI ranks, and pass 2
+    ! finishes every box with the results (see fullchem_lb_mod.F90).
     !========================================================================
+    lbPass = 0
+    IF ( Input_Opt%Chem_LoadBalance ) THEN
+       lbPass = 1
+       CALL LB_Begin( State_Grid%NX, State_Grid%NY, State_Grid%NZ )
+    ENDIF
+
+    DO
     !$OMP PARALLEL DO                                                        &
     !$OMP DEFAULT( SHARED                                                   )&
     !$OMP PRIVATE( I,        J,        L,       N                           )&
@@ -564,6 +578,13 @@ CONTAINS
        Thread    = OMP_GET_THREAD_NUM() + 1 ! OpenMP thread number
 #endif
 #endif
+
+       ! Load balancing pass 2: the box was prepared in pass 1, so restore
+       ! its KPP inputs and go straight to the integration results
+       IF ( lbPass == 2 ) THEN
+          IF ( .not. LB_IsActive( I, J, L ) ) CYCLE
+          CALL LB_Restore( I, J, L, ICNTRL, RCNTRL )
+       ELSE
 
        ! Per discussions for Lin et al., force keepActive throughout the
        ! atmosphere if keepActive option is enabled. (hplin, 2/9/22)
@@ -982,6 +1003,14 @@ CONTAINS
                                               I,         J,         L,       &
                                               ICNTRL,    RCNTRL             )
 
+       ! Load balancing pass 1: store the KPP inputs; LB_Run integrates
+       IF ( lbPass == 1 ) THEN
+          CALL LB_Store( I, J, L, ICNTRL, RCNTRL )
+          CYCLE
+       ENDIF
+
+       ENDIF  ! lbPass == 2
+
        !=====================================================================
        ! Integrate the box forwards
        !=====================================================================
@@ -992,8 +1021,12 @@ CONTAINS
 
        ! Call the Rosenbrock integrator
        ! (with optional auto-reduce functionality)
-       CALL Integrate( TIN,    TOUT,    ICNTRL,                              &
-                       RCNTRL, ISTATUS, RSTATE, IERR                        )
+       IF ( lbPass == 2 ) THEN
+          CALL LB_Result( 1, I, J, L, ISTATUS, RSTATE, IERR )
+       ELSE
+          CALL Integrate( TIN,    TOUT,    ICNTRL,                           &
+                          RCNTRL, ISTATUS, RSTATE, IERR                     )
+       ENDIF
 
        ! Print grid box indices to screen if integrate failed
        IF ( IERR < 0 ) THEN
@@ -1043,7 +1076,11 @@ CONTAINS
 
           ! Check for negative concentrations after first integration
           IF ( State_Diag%Archive_KppNegatives0 ) THEN
-             State_Diag%KppNegatives0(I,J,L) = REAL( COUNT( C < 0.0_dp ), KIND=4 )
+             IF ( lbPass == 2 ) THEN
+                State_Diag%KppNegatives0(I,J,L) = REAL( LB_Neg0( I, J, L ), KIND=4 )
+             ELSE
+                State_Diag%KppNegatives0(I,J,L) = REAL( COUNT( C < 0.0_dp ), KIND=4 )
+             ENDIF
           ENDIF
           
           ! # of integrator calls
@@ -1114,12 +1151,16 @@ CONTAINS
              RCNTRL(12) = -1.0_dp ! without using ICNTRL
           ENDIF
 
-          ! Update rates again
-          CALL Update_RCONST( )
+          ! Update rates again (in pass 2, RCONST was restored from pass 1)
+          IF ( lbPass /= 2 ) CALL Update_RCONST( )
 
           ! Call the Rosenbrock integrator (w/ auto-reduction disabled)
-          CALL Integrate( TIN,    TOUT,    ICNTRL,                           &
-                          RCNTRL, ISTATUS, RSTATE, IERR                     )
+          IF ( lbPass == 2 ) THEN
+             CALL LB_Result( 2, I, J, L, ISTATUS, RSTATE, IERR )
+          ELSE
+             CALL Integrate( TIN,    TOUT,    ICNTRL,                        &
+                             RCNTRL, ISTATUS, RSTATE, IERR                  )
+          ENDIF
 
           !==================================================================
           ! HISTORY: Archive KPP solver diagnostics
@@ -1256,8 +1297,13 @@ CONTAINS
        ! Save cpu time spent for bulk of KPP-related routines for 
        ! History archival (hplin, 11/8/21)
        IF ( State_Diag%Archive_KppTime ) THEN
-          call cpu_time(TimeEnd)
-          State_Diag%KppTime(I,J,L) = TimeEnd - TimeStart
+          IF ( lbPass == 2 ) THEN
+             ! Wall time of the integration, on whichever rank it ran
+             State_Diag%KppTime(I,J,L) = LB_Time( I, J, L )
+          ELSE
+             call cpu_time(TimeEnd)
+             State_Diag%KppTime(I,J,L) = TimeEnd - TimeStart
+          ENDIF
        ENDIF
 
        !=====================================================================
@@ -1481,6 +1527,13 @@ CONTAINS
     ENDDO
     ENDDO
     !$OMP END PARALLEL DO
+
+    ! Load balancing: integrate all boxes stored in pass 1, then pass 2
+    IF ( lbPass /= 1 ) EXIT
+    CALL LB_Run( Input_Opt%MPIComm, TIN, TOUT, Input_Opt%Use_AutoReduce, RC )
+    IF ( RC /= GC_SUCCESS ) RETURN
+    lbPass = 2
+    ENDDO
 
     !=======================================================================
     ! Return gracefully if integration failed 2x anywhere
