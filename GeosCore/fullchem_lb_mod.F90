@@ -32,6 +32,7 @@ MODULE FullChem_LB_Mod
 ! !USES:
 !
   USE gckpp_Parameters, ONLY : NSPEC, NREACT
+  USE gckpp_Precision,  ONLY : dp
   USE Precision_Mod
 #if defined( MODEL_GCHP )
   USE mpi
