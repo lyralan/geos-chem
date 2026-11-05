@@ -84,6 +84,13 @@ MODULE FullChem_LB_Mod
   ! step it is the work estimate for the next one
   REAL(dp), ALLOCATABLE :: Cost(:)
 
+  ! Time spent in each phase of LB_Run [s], summed over chemistry steps:
+  ! 1 plan, 2 work transfer, 3 received boxes, 4 own boxes, 5 results wait
+  ! Printed (max and mean over ranks) every NREPORT steps
+  INTEGER,  PARAMETER   :: NPH = 5, NREPORT = 72
+  REAL(dp)              :: Tph(NPH) = 0.0_dp
+  INTEGER               :: nCall = 0
+
 CONTAINS
 !EOC
 !------------------------------------------------------------------------------
@@ -357,7 +364,7 @@ CONTAINS
     REAL(dp), PARAMETER   :: MIN_FRAC = 0.005_dp
 
     INTEGER               :: nRank, me, ierr, K, B, R, S, T, nAct
-    INTEGER               :: nTr, iD, iR, nDon, nRec, idx, nDone
+    INTEGER               :: nTr, iD, iR, nDon, nRec, idx
     REAL(dp)              :: wDef, myLoad, Mean, Amt, Got
     INTEGER,  ALLOCATABLE :: Act(:), Ord(:), Dest(:), DonR(:), RecR(:)
     INTEGER,  ALLOCATABLE :: TrD(:), TrR(:), nSend(:), nRecv(:)
@@ -365,10 +372,13 @@ CONTAINS
     REAL(dp), ALLOCATABLE :: W(:), Load(:), Ex(:), De(:), TrA(:)
     REAL(dp), ALLOCATABLE :: WorkS(:,:), WorkR(:,:), ResS(:,:), ResR(:,:)
     INTEGER,  ALLOCATABLE :: OffS(:), OffR(:)
+    REAL(dp)              :: T0, Tmax(NPH), Tsum(NPH), Res1(SZOUT)
+    LOGICAL               :: Flag
 
     RC = GC_SUCCESS
     CALL MPI_Comm_size( Comm, nRank, ierr )
     CALL MPI_Comm_rank( Comm, me,    ierr )
+    T0 = Wtime()
 
     !------------------------------------------------------------------
     ! Work estimate of each active box: last step's time; boxes without
@@ -490,26 +500,23 @@ CONTAINS
        CALL MPI_Irecv( WorkR(1,OffR(R)+1), SZIN*nRecv(R),                    &
                        MPI_DOUBLE_PRECISION, R, TAG_WORK, Comm, ReqW(R), ierr )
     ENDDO
+    CALL AddTime( 1, T0 )
 
     !------------------------------------------------------------------
-    ! Integrate the boxes kept here
+    ! Finish moving the work before integrating anything: MPI moves a
+    ! large message only while the sender is inside an MPI call, so work
+    ! left in flight would reach the receiver only after the donor had
+    ! integrated all of its own boxes.  The messages are a few MB.
     !------------------------------------------------------------------
-    DO B = 1, nAct
-       IF ( Dest(B) /= me ) CYCLE
-       K = Act(B)
-       CALL SolveBox( Cin(:,K), Rin(:,K), Icn(:,K), Rcn(:,K), TIN, TOUT,     &
-                      UseAR,    ResS(:,1) )
-       CALL UnpackResult( K, ResS(:,1) )
-    ENDDO
+    CALL MPI_Waitall( nRank, ReqW, MPI_STATUSES_IGNORE, ierr )
+    CALL MPI_Waitall( nRank, Req,  MPI_STATUSES_IGNORE, ierr )
+    CALL AddTime( 2, T0 )
 
     !------------------------------------------------------------------
-    ! Integrate received boxes as their messages arrive; send results back
+    ! Integrate the received boxes first and send their results back
     !------------------------------------------------------------------
-    nDone = 0
-    DO WHILE ( nDone < COUNT( nRecv > 0 ) )
-       CALL MPI_Waitany( nRank, ReqW, idx, MPI_STATUS_IGNORE, ierr )
-       R = idx - 1
-       nDone = nDone + 1
+    DO R = 0, nRank-1
+       IF ( nRecv(R) == 0 ) CYCLE
        DO S = OffR(R)+1, OffR(R+1)
           CALL SolveBox( WorkR(1:NSPEC,S),                                   &
                          WorkR(NSPEC+1:NSPEC+NREACT,S),                      &
@@ -521,6 +528,22 @@ CONTAINS
                        MPI_DOUBLE_PRECISION, R, TAG_RESULT, Comm, ReqS(R),   &
                        ierr )
     ENDDO
+    CALL AddTime( 3, T0 )
+
+    !------------------------------------------------------------------
+    ! Integrate the boxes kept here; poll MPI between boxes so that the
+    ! results in flight keep moving
+    !------------------------------------------------------------------
+    DO B = 1, nAct
+       IF ( Dest(B) /= me ) CYCLE
+       K = Act(B)
+       CALL SolveBox( Cin(:,K), Rin(:,K), Icn(:,K), Rcn(:,K), TIN, TOUT,     &
+                      UseAR,    Res1 )
+       CALL UnpackResult( K, Res1 )
+       CALL MPI_Testall( nRank, ReqS, Flag, MPI_STATUSES_IGNORE, ierr )
+       CALL MPI_Testall( nRank, ReqR, Flag, MPI_STATUSES_IGNORE, ierr )
+    ENDDO
+    CALL AddTime( 4, T0 )
 
     !------------------------------------------------------------------
     ! Collect the results of the boxes sent away
@@ -529,8 +552,26 @@ CONTAINS
     DO S = 1, OffS(nRank)
        CALL UnpackResult( SendList(S,1), ResR(:,S) )
     ENDDO
-    CALL MPI_Waitall( nRank, Req,  MPI_STATUSES_IGNORE, ierr )
     CALL MPI_Waitall( nRank, ReqS, MPI_STATUSES_IGNORE, ierr )
+    CALL AddTime( 5, T0 )
+
+    !------------------------------------------------------------------
+    ! Phase times, max and mean over ranks, every NREPORT steps
+    !------------------------------------------------------------------
+    nCall = nCall + 1
+    IF ( MOD( nCall, NREPORT ) == 0 ) THEN
+       CALL MPI_Reduce( Tph, Tmax, NPH, MPI_DOUBLE_PRECISION, MPI_MAX, 0,    &
+                        Comm, ierr )
+       CALL MPI_Reduce( Tph, Tsum, NPH, MPI_DOUBLE_PRECISION, MPI_SUM, 0,    &
+                        Comm, ierr )
+       IF ( me == 0 ) THEN
+          WRITE( 6, 100 ) nCall, 'max ', Tmax
+          WRITE( 6, 100 ) nCall, 'mean', Tsum / nRank
+       ENDIF
+       Tph = 0.0_dp
+    ENDIF
+100 FORMAT( 'LB_Run phases after ', I6, ' steps, ', A4,                     &
+            ' [s] plan/xfer/recv/own/wait:', 5F10.2 )
 
     DEALLOCATE( Act, W, Dest, Load, DonR, RecR, Ex, De, TrD, TrR, TrA, Ord,  &
                 nSend, nRecv, OffS, OffR, SendList, WorkS, ResR, WorkR,      &
@@ -542,6 +583,30 @@ CONTAINS
 #endif
 
   END SUBROUTINE LB_Run
+!EOC
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: AddTime
+!
+! !DESCRIPTION: Adds the time since T0 to LB\_Run phase Ph and restarts T0.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE AddTime( Ph, T0 )
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+    INTEGER,  INTENT(IN)    :: Ph
+    REAL(dp), INTENT(INOUT) :: T0
+    REAL(dp)                :: T1
+
+    T1      = Wtime()
+    Tph(Ph) = Tph(Ph) + ( T1 - T0 )
+    T0      = T1
+
+  END SUBROUTINE AddTime
 !EOC
 !------------------------------------------------------------------------------
 !BOP
