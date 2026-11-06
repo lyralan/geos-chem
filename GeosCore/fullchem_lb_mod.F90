@@ -85,9 +85,10 @@ MODULE FullChem_LB_Mod
   REAL(dp), ALLOCATABLE :: Cost(:)
 
   ! Time spent in each phase of LB_Run [s], summed over chemistry steps:
-  ! 1 plan, 2 work transfer, 3 received boxes, 4 own boxes, 5 results wait
+  ! 1 own boxes integrated while waiting for the other ranks to arrive,
+  ! 2 plan, 3 work transfer, 4 received boxes, 5 own boxes, 6 results wait
   ! Printed (max and mean over ranks) every NREPORT steps
-  INTEGER,  PARAMETER   :: NPH = 5, NREPORT = 72
+  INTEGER,  PARAMETER   :: NPH = 6, NREPORT = 72
   REAL(dp)              :: Tph(NPH) = 0.0_dp
   INTEGER               :: nCall = 0
 
@@ -334,8 +335,12 @@ CONTAINS
 !  plan is computed identically on every rank from the gathered per-rank
 !  work estimates: ranks above the mean (donors) are paired with ranks below
 !  it (receivers), largest first; each donor sends its most expensive boxes
-!  until the agreed amount of work is covered.  Every rank integrates the
-!  boxes it kept first and the boxes it received next.
+!  until the agreed amount of work is covered.  Ranks reach LB_Run at
+!  different times (photolysis, transport and deposition cost differ by
+!  column), so until the last rank has arrived each rank integrates its own
+!  boxes, cheapest first (those a donor would keep anyway); the plan then
+!  covers the boxes still left.  Every rank integrates the boxes it
+!  received first and the boxes it kept next.
 !\\
 !\\
 ! !INTERFACE:
@@ -364,8 +369,9 @@ CONTAINS
     REAL(dp), PARAMETER   :: MIN_FRAC = 0.005_dp
 
     INTEGER               :: nRank, me, ierr, K, B, R, S, T, nAct
-    INTEGER               :: nTr, iD, iR, nDon, nRec, idx
+    INTEGER               :: nTr, iD, iR, nDon, nRec, idx, nLeft, ReqB
     REAL(dp)              :: wDef, myLoad, Mean, Amt, Got
+    LOGICAL,  ALLOCATABLE :: Done(:)
     INTEGER,  ALLOCATABLE :: Act(:), Ord(:), Dest(:), DonR(:), RecR(:)
     INTEGER,  ALLOCATABLE :: TrD(:), TrR(:), nSend(:), nRecv(:)
     INTEGER,  ALLOCATABLE :: SendList(:,:), Req(:), ReqW(:), ReqR(:), ReqS(:)
@@ -395,7 +401,28 @@ CONTAINS
        wDef = 1.0_dp
     ENDIF
     WHERE( W <= 0.0_dp ) W = wDef
-    myLoad = SUM( W )
+
+    !------------------------------------------------------------------
+    ! Until every rank has arrived, integrate own boxes, cheapest first
+    !------------------------------------------------------------------
+    ALLOCATE( Done(nAct), Ord(nAct) )
+    Done = .FALSE.
+    Ord  = [ ( B, B = 1, nAct ) ]
+    CALL SortDesc( -W, Ord )
+    Flag = .FALSE.
+    CALL MPI_Ibarrier( Comm, ReqB, ierr )
+    DO idx = 1, nAct
+       CALL MPI_Test( ReqB, Flag, MPI_STATUS_IGNORE, ierr )
+       IF ( Flag ) EXIT
+       B = Ord(idx)
+       CALL SolveBox( Cin(:,Act(B)), Rin(:,Act(B)), Icn(:,Act(B)),           &
+                      Rcn(:,Act(B)), TIN, TOUT, UseAR, Res1 )
+       CALL UnpackResult( Act(B), Res1 )
+       Done(B) = .TRUE.
+    ENDDO
+    IF ( .not. Flag ) CALL MPI_Wait( ReqB, MPI_STATUS_IGNORE, ierr )
+    CALL AddTime( 1, T0 )
+    myLoad = SUM( W, MASK = .not. Done )
 
     ALLOCATE( Load(0:nRank-1) )
     CALL MPI_Allgather( myLoad, 1, MPI_DOUBLE_PRECISION,                     &
@@ -436,14 +463,14 @@ CONTAINS
     !------------------------------------------------------------------
     ! As a donor: pick the boxes for each transfer, most expensive first
     !------------------------------------------------------------------
-    ALLOCATE( Ord(nAct) )
-    Ord = [ ( B, B = 1, nAct ) ]
-    CALL SortDesc( W, Ord )
+    nLeft        = COUNT( .not. Done )
+    Ord(1:nLeft) = PACK( [ ( B, B = 1, nAct ) ], .not. Done )
+    CALL SortDesc( W(Ord(1:nLeft)), Ord(1:nLeft) )
     idx = 1
     DO T = 1, nTr
        IF ( TrD(T) /= me ) CYCLE
        Got = 0.0_dp
-       DO WHILE ( idx <= nAct .and. Got < TrA(T) - 0.5_dp * W(Ord(idx)) )
+       DO WHILE ( idx <= nLeft .and. Got < TrA(T) - 0.5_dp * W(Ord(idx)) )
           Dest(Ord(idx)) = TrR(T)
           Got = Got + W(Ord(idx))
           idx = idx + 1
@@ -500,7 +527,7 @@ CONTAINS
        CALL MPI_Irecv( WorkR(1,OffR(R)+1), SZIN*nRecv(R),                    &
                        MPI_DOUBLE_PRECISION, R, TAG_WORK, Comm, ReqW(R), ierr )
     ENDDO
-    CALL AddTime( 1, T0 )
+    CALL AddTime( 2, T0 )
 
     !------------------------------------------------------------------
     ! Finish moving the work before integrating anything: MPI moves a
@@ -510,7 +537,7 @@ CONTAINS
     !------------------------------------------------------------------
     CALL MPI_Waitall( nRank, ReqW, MPI_STATUSES_IGNORE, ierr )
     CALL MPI_Waitall( nRank, Req,  MPI_STATUSES_IGNORE, ierr )
-    CALL AddTime( 2, T0 )
+    CALL AddTime( 3, T0 )
 
     !------------------------------------------------------------------
     ! Integrate the received boxes first and send their results back
@@ -528,14 +555,14 @@ CONTAINS
                        MPI_DOUBLE_PRECISION, R, TAG_RESULT, Comm, ReqS(R),   &
                        ierr )
     ENDDO
-    CALL AddTime( 3, T0 )
+    CALL AddTime( 4, T0 )
 
     !------------------------------------------------------------------
     ! Integrate the boxes kept here; poll MPI between boxes so that the
     ! results in flight keep moving
     !------------------------------------------------------------------
     DO B = 1, nAct
-       IF ( Dest(B) /= me ) CYCLE
+       IF ( Dest(B) /= me .or. Done(B) ) CYCLE
        K = Act(B)
        CALL SolveBox( Cin(:,K), Rin(:,K), Icn(:,K), Rcn(:,K), TIN, TOUT,     &
                       UseAR,    Res1 )
@@ -543,7 +570,7 @@ CONTAINS
        CALL MPI_Testall( nRank, ReqS, Flag, MPI_STATUSES_IGNORE, ierr )
        CALL MPI_Testall( nRank, ReqR, Flag, MPI_STATUSES_IGNORE, ierr )
     ENDDO
-    CALL AddTime( 4, T0 )
+    CALL AddTime( 5, T0 )
 
     !------------------------------------------------------------------
     ! Collect the results of the boxes sent away
@@ -553,7 +580,7 @@ CONTAINS
        CALL UnpackResult( SendList(S,1), ResR(:,S) )
     ENDDO
     CALL MPI_Waitall( nRank, ReqS, MPI_STATUSES_IGNORE, ierr )
-    CALL AddTime( 5, T0 )
+    CALL AddTime( 6, T0 )
 
     !------------------------------------------------------------------
     ! Phase times, max and mean over ranks, every NREPORT steps
@@ -571,10 +598,10 @@ CONTAINS
        Tph = 0.0_dp
     ENDIF
 100 FORMAT( 'LB_Run phases after ', I6, ' steps, ', A4,                     &
-            ' [s] plan/xfer/recv/own/wait:', 5F10.2 )
+            ' [s] early/plan/xfer/recv/own/wait:', 6F9.2 )
 
-    DEALLOCATE( Act, W, Dest, Load, DonR, RecR, Ex, De, TrD, TrR, TrA, Ord,  &
-                nSend, nRecv, OffS, OffR, SendList, WorkS, ResR, WorkR,      &
+    DEALLOCATE( Done, Act, W, Dest, Load, DonR, RecR, Ex, De, TrD, TrR, TrA, &
+                Ord, nSend, nRecv, OffS, OffR, SendList, WorkS, ResR, WorkR, &
                 ResS, Req, ReqW, ReqR, ReqS )
 #else
     RC = GC_FAILURE
